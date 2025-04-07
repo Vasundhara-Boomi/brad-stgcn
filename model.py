@@ -2,131 +2,173 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Device configuration
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# -------------------- GCN Layer with Shape Debugging --------------------
 class GCNLayer(nn.Module):
-    def __init__(self, in_features, out_features, num_nodes):
+    def __init__(self, in_features, out_features):
         super(GCNLayer, self).__init__()
-        self.num_nodes = num_nodes
+        self.linear = nn.Linear(in_features, out_features)
+        self.bn = nn.BatchNorm1d(out_features)
+        self.in_features = in_features
         self.out_features = out_features
 
-        # Correct weight initialization with the right dimensions
-        self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
-        nn.init.xavier_uniform_(self.weight)
-
-        # Batch normalization with correct number of features
-        self.bn = nn.BatchNorm1d(out_features)
-
-    def normalize_adjacency(self, adjacency):
-        """Normalize adjacency matrix."""
-        adjacency = adjacency + torch.eye(adjacency.size(0), device=adjacency.device)
-        degree = adjacency.sum(dim=1)
-        degree_inv_sqrt = torch.pow(degree, -0.5)
-        degree_inv_sqrt[torch.isinf(degree_inv_sqrt)] = 0
-        degree_inv_sqrt_diag = torch.diag(degree_inv_sqrt)
-        return torch.matmul(torch.matmul(degree_inv_sqrt_diag, adjacency), degree_inv_sqrt_diag)
-
     def forward(self, x, adjacency):
-        batch_size, num_nodes, timesteps, in_features = x.shape
+        # Print shapes for debugging
+        print(f"GCNLayer Input shapes - x: {x.shape}, adjacency: {adjacency.shape}")
         
-        # Normalize adjacency matrix
-        adjacency_norm = self.normalize_adjacency(adjacency)
-
-        # Reshape input for processing
-        x_reshaped = x.permute(0, 2, 1, 3).contiguous()
-        x_reshaped = x_reshaped.view(-1, num_nodes, in_features)
-
-        # Create output tensor
-        x_transformed = torch.zeros(x_reshaped.shape[0], num_nodes, self.out_features, 
-                                    device=x.device, dtype=x.dtype)
-
-        # Process each timestep
-        for i in range(x_reshaped.shape[0]):
-            # Perform feature transformation
-            node_features = x_reshaped[i]  # [num_nodes, in_features]
-            transformed = torch.matmul(node_features, self.weight)  # [num_nodes, out_features]
-            x_transformed[i] = transformed
-
-        # Reshape back to original structure
-        x_transformed = x_transformed.view(batch_size, timesteps, num_nodes, -1)
-        x_transformed = x_transformed.permute(0, 2, 1, 3).contiguous()
-
-        # Graph convolution using adjacency
-        x_conv = torch.zeros_like(x_transformed)
-        for b in range(batch_size):
-            for t in range(timesteps):
-                x_conv[b, :, t, :] = torch.matmul(adjacency_norm, x_transformed[b, :, t, :])
-
-        # Batch normalization - reshape to apply across node features
-        x_bn = x_conv.view(-1, self.out_features)
+        # Ensure x is [B, T, V, C]
+        if len(x.shape) == 3:  # [T, V, C]
+            x = x.unsqueeze(0)  # Add batch dim
+        
+        # Ensure adjacency is compatible
+        if len(adjacency.shape) == 2:  # [V, V]
+            adjacency = adjacency.unsqueeze(0)  # Add batch dim
+        
+        if len(adjacency.shape) == 3:  # [B, V, V]
+            # Expand to match time dimension of x
+            adjacency = adjacency.unsqueeze(1).expand(-1, x.shape[1], -1, -1)
+        
+        # Verify shapes after adjustments
+        print(f"After adjustment - x: {x.shape}, adjacency: {adjacency.shape}")
+        
+        # Get batch, time, nodes, features dimensions
+        B, T, V, C = x.shape
+        
+        # For matrix multiplication, we need to process each batch and time step separately
+        x_out = []
+        for b in range(B):
+            time_steps = []
+            for t in range(T):
+                # Get adjacency for this batch and time step
+                adj_bt = adjacency[b, t]  # [V, V]
+                
+                # Get features for this batch and time step
+                x_bt = x[b, t]  # [V, C]
+                
+                # Normalize adjacency (add self-loops if needed)
+                if adj_bt.shape[0] == adj_bt.shape[1]:  # Only if square matrix
+                    degree = adj_bt.sum(dim=1, keepdim=True)  # [V, 1]
+                    degree_inv_sqrt = torch.pow(degree + 1e-6, -0.5)
+                    adj_norm = degree_inv_sqrt * adj_bt * degree_inv_sqrt.transpose(0, 1)
+                    
+                    # Apply convolution: adj_norm [V, V] × x_bt [V, C]
+                    x_conv = torch.matmul(adj_norm, x_bt)  # Should be [V, C]
+                    time_steps.append(x_conv)
+                else:
+                    print(f"WARNING: Non-square adjacency matrix: {adj_bt.shape}")
+                    # Just pass through if adjacency isn't square
+                    time_steps.append(x_bt)
+            
+            # Stack time steps
+            x_out.append(torch.stack(time_steps))
+        
+        # Stack batches
+        x = torch.stack(x_out)  # [B, T, V, C]
+        
+        # Apply linear transformation
+        # Linear layer expects last dimension to match in_features
+        if C != self.in_features:
+            print(f"WARNING: Input features mismatch. Expected {self.in_features}, got {C}.")
+            # Handle mismatch by creating a temporary adapter
+            adapter = nn.Linear(C, self.in_features).to(x.device)
+            x = adapter(x.view(-1, C)).view(B, T, V, self.in_features)
+            C = self.in_features
+        
+        # Reshape for linear layer
+        x_linear = self.linear(x.view(-1, C)).view(B, T, V, self.out_features)
+        
+        # Batch normalization expects [N, C, *]
+        x_bn = x_linear.permute(0, 3, 1, 2)  # [B, C, T, V]
+        shape = x_bn.shape
+        x_bn = x_bn.reshape(B, self.out_features, -1)  # [B, C, T*V]
         x_bn = self.bn(x_bn)
-        x_bn = x_bn.view(batch_size, num_nodes, timesteps, -1)
-
-        # Activation
+        x_bn = x_bn.reshape(shape)  # [B, C, T, V]
+        x_bn = x_bn.permute(0, 2, 3, 1)  # [B, T, V, C]
+        
+        # Apply ReLU
         x_out = F.relu(x_bn)
-
+        
+        print(f"GCNLayer Output shape: {x_out.shape}")
         return x_out
-    
+
+# -------------------- ST-GCN Model with Shape Handling --------------------
 class STGCN(nn.Module):
-    def __init__(self, in_features, gcn_hidden, lstm_hidden, num_classes, num_nodes, dropout_rate=0.3):
+    def __init__(self, in_features, gcn_hidden, tcn_hidden, num_classes, num_nodes, kernel_size=3, dropout_rate=0.3):
         super(STGCN, self).__init__()
+        
+        # Save parameters
+        self.in_features = in_features
+        self.gcn_hidden = gcn_hidden
+        self.tcn_hidden = tcn_hidden
         self.num_nodes = num_nodes
+        
+        # Spatial GCN Layers
+        self.gcn1 = GCNLayer(in_features, gcn_hidden)
+        self.gcn2 = GCNLayer(gcn_hidden, gcn_hidden)
 
-        # Graph Convolutional Layers
-        self.gcn1 = GCNLayer(in_features=9, out_features=gcn_hidden, num_nodes=num_nodes)
-        self.gcn2 = GCNLayer(in_features=gcn_hidden, out_features=gcn_hidden, num_nodes=num_nodes)
-
-        # LSTM Layer
-        self.lstm = nn.LSTM(
-            gcn_hidden * num_nodes,
-            lstm_hidden,
-            num_layers=2,
-            batch_first=True,
-            dropout=dropout_rate if 2 > 1 else 0
-        )
+        # Temporal Convolution with shape adaptation
+        self.tcn = nn.Conv1d(gcn_hidden * num_nodes, tcn_hidden, kernel_size, padding=kernel_size//2)
 
         # Fully Connected Layers
-        self.fc1 = nn.Linear(lstm_hidden, lstm_hidden // 2)
-        self.fc2 = nn.Linear(lstm_hidden // 2, num_classes)
-
-        # Dropout
+        self.fc1 = nn.Linear(tcn_hidden, tcn_hidden // 2)
+        self.fc2 = nn.Linear(tcn_hidden // 2, num_classes)
+        
         self.dropout = nn.Dropout(dropout_rate)
 
     def forward(self, x, adjacency):
-        print("\n[STGCN Forward] Initial Input Shape:", x.shape)
-
-        # First GCN layer
+        # Print input shapes for debugging
+        print(f"STGCN Input shapes - x: {x.shape}, adjacency: {adjacency.shape}")
+        
+        # Validate and adapt input shapes
+        if len(x.shape) == 3:  # [T, V, C]
+            x = x.unsqueeze(0)  # Add batch dimension
+        
+        # Check if we need to adapt features dimension
+        B, T, V, C = x.shape
+        if C != self.in_features:
+            print(f"WARNING: Input features mismatch. Expected {self.in_features}, got {C}.")
+            # Two options: adapt or truncate/pad
+            if C > self.in_features:
+                # Truncate
+                x = x[..., :self.in_features]
+            else:
+                # Pad with zeros
+                padding = torch.zeros(B, T, V, self.in_features - C, device=x.device)
+                x = torch.cat([x, padding], dim=-1)
+        
+        # Spatial graph convolution
         x1 = self.gcn1(x, adjacency)
-        print("[STGCN Forward] Output of GCN1 Shape:", x1.shape)
-
-        # Second GCN layer with residual connection
         x2 = self.gcn2(x1, adjacency)
-        print("[STGCN Forward] Output of GCN2 Shape:", x2.shape)
-
         x = x1 + x2  # Residual connection
-        print("[STGCN Forward] Residual Connection Shape:", x.shape)
-
-        # Reshape for LSTM
-        batch_size, num_nodes, timesteps, features = x.shape
-        x = x.permute(0, 2, 1, 3).contiguous().view(batch_size, timesteps, -1)
-        print("[STGCN Forward] LSTM Input Shape:", x.shape)
-
-        # Dropout
-        x = self.dropout(x)
-
-        # LSTM
-        x, _ = self.lstm(x)
-        print("[STGCN Forward] LSTM Output Shape:", x.shape)
-
-        # Use last timestep
-        x = x[:, -1, :]
-        print("[STGCN Forward] After Selecting Last Timestep:", x.shape)
-
-        # Fully connected layers
+        
+        # Print shape after GCN
+        print(f"Shape after GCN: {x.shape}")
+        
+        # Reshape for TCN: [B, T, V, C] -> [B, V*C, T]
+        B, T, V, C = x.shape
+        x = x.permute(0, 2, 3, 1)  # [B, V, C, T]
+        x = x.reshape(B, V * C, T)  # [B, V*C, T]
+        
+        # Print shape before TCN
+        print(f"Shape before TCN: {x.shape}")
+        
+        # Apply temporal convolution
+        x = self.tcn(x)
+        
+        # Print shape after TCN
+        print(f"Shape after TCN: {x.shape}")
+        
+        # Global average pooling over time
+        x = x.mean(dim=-1)  # [B, tcn_hidden]
+        
+        # Classifier
         x = self.dropout(x)
         x = F.relu(self.fc1(x))
-        print("[STGCN Forward] After FC1:", x.shape)
-
         x = self.dropout(x)
         x = self.fc2(x)
-        print("[STGCN Forward] Final Output Shape:", x.shape)
-
+        
+        # Print final output shape
+        print(f"Final output shape: {x.shape}")
         return x

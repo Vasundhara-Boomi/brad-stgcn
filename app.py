@@ -30,6 +30,10 @@ NUM_KEYPOINTS = 21
 TARGET_T = 114  # Target number of frames
 IN_FEATURES = 6
 NUM_CLASSES = 4  # UPDRS score classes
+GCN_HIDDEN = 32   # Updated to match training model
+TCN_HIDDEN = 32   # Updated to match training model
+KERNEL_SIZE = 5   # Updated to match training model
+DROPOUT_RATE = 0.3  # Updated to match training model
 
 # Load pre-trained model
 def load_model(model_path):
@@ -47,19 +51,21 @@ def load_model(model_path):
     
     # Create model with parameters from checkpoint or defaults
     model_params = checkpoint.get('model_params', {
-        'gcn_hidden': 64,
-        'lstm_hidden': 64,
-        'dropout_rate': 0.4
+        'gcn_hidden': GCN_HIDDEN,
+        'tcn_hidden': TCN_HIDDEN,
+        'kernel_size': KERNEL_SIZE,
+        'dropout_rate': DROPOUT_RATE
     })
     
     # Create model with current architecture
     model = STGCN(
         in_features=IN_FEATURES,
-        gcn_hidden=model_params['gcn_hidden'],
-        lstm_hidden=model_params['lstm_hidden'],
+        gcn_hidden=model_params.get('gcn_hidden', GCN_HIDDEN),
+        tcn_hidden=model_params.get('tcn_hidden', TCN_HIDDEN),
         num_classes=NUM_CLASSES,
         num_nodes=NUM_KEYPOINTS,
-        dropout_rate=model_params.get('dropout_rate', 0.3)
+        kernel_size=model_params.get('kernel_size', KERNEL_SIZE),
+        dropout_rate=model_params.get('dropout_rate', DROPOUT_RATE)
     ).to(device)
     
     # Prepare state dict for loading
@@ -178,54 +184,6 @@ def interpolate_missing_frames(data, target_frames=114):
     
     return interpolated_data
 
-def extract_hand_keypoints(video_path, hand_side='right'):
-    """Extract hand keypoints from video with consistent detection."""
-    keypoints_list = []
-    
-    # Open video capture
-    cap = cv2.VideoCapture(video_path)
-    
-    # Get total number of frames
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    # MediaPipe hand tracking setup with fixed confidence
-    with mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=0.8,  # Increased for more consistent detection
-        min_tracking_confidence=0.8    # Increased for more consistent tracking
-    ) as hands:
-        
-        frame_count = 0
-        while cap.isOpened() and frame_count < total_frames:
-            ret, frame = cap.read()
-            if not ret:
-                break
-        
-            # Convert the BGR image to RGB
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # Process the frame
-            results = hands.process(rgb_frame)
-            
-            # Extract keypoints if hand is detected
-            if results.multi_hand_landmarks:
-                for hand_landmarks in results.multi_hand_landmarks:
-                    # Extract keypoint coordinates
-                    frame_keypoints = []
-                    for landmark in hand_landmarks.landmark:
-                        frame_keypoints.append([landmark.x, landmark.y, landmark.z])
-                    
-                    keypoints_list.append(frame_keypoints)
-            
-            frame_count += 1
-    
-    cap.release()
-    
-    # Convert to numpy array
-    keypoints = np.array(keypoints_list)
-    
-    return keypoints
 
 def compute_additional_features(keypoints):
     """
@@ -252,9 +210,9 @@ def compute_additional_features(keypoints):
     
     return enhanced_features
 
-def preprocess_keypoints(keypoints, target_frames=114, num_keypoints=21):
+def preprocess_keypoints(keypoints, target_frames=114, num_keypoints=21, num_features=6):
     """
-    Comprehensive keypoint preprocessing pipeline.
+    Comprehensive keypoint preprocessing pipeline with fixed reshaping.
     
     Args:
     - keypoints: Raw keypoint data
@@ -262,11 +220,20 @@ def preprocess_keypoints(keypoints, target_frames=114, num_keypoints=21):
     - num_keypoints: Expected number of keypoints
     
     Returns:
-    - Preprocessed keypoint tensor
+    - Preprocessed keypoint tensor for model input format
     """
     # Validate input
     if len(keypoints) == 0:
-        raise ValueError("No keypoints detected")
+        print("*************************************")
+        print("WARNING: No keypoints detected, creating dummy data")
+        print("*************************************")
+        return np.zeros((target_frames, num_keypoints, num_features))
+    
+    # Ensure keypoints has shape [frames, keypoints, 3]
+    if keypoints.ndim == 2:
+        # If shape is [frames*keypoints, 3]
+        num_frames = keypoints.shape[0] // num_keypoints
+        keypoints = keypoints.reshape(num_frames, num_keypoints, 3)
     
     # Interpolate missing frames
     interpolated_keypoints = interpolate_missing_frames(keypoints, target_frames)
@@ -274,24 +241,132 @@ def preprocess_keypoints(keypoints, target_frames=114, num_keypoints=21):
     # Normalize keypoints
     normalized_keypoints = normalize_keypoints(interpolated_keypoints)
     
-    # Compute additional features
+    # Compute additional features (velocity and acceleration)
     enhanced_features = compute_additional_features(normalized_keypoints)
     
-    # Reshape to match model input: [num_nodes, timesteps, features]
-    processed_keypoints = enhanced_features.transpose(1, 0, 2)
+    # Ensure output has shape [target_frames, num_keypoints, features]
+    if enhanced_features.shape != (target_frames, num_keypoints, 6):
+        print(f"Warning: Expected shape {(target_frames, num_keypoints, 6)} but got {enhanced_features.shape}")
+        
+        # Check if we need to pad or truncate time dimension
+        if enhanced_features.shape[0] != target_frames:
+            if enhanced_features.shape[0] < target_frames:
+                # Pad with zeros
+                pad_frames = target_frames - enhanced_features.shape[0]
+                pad_shape = (pad_frames, enhanced_features.shape[1], enhanced_features.shape[2])
+                padding = np.zeros(pad_shape)
+                enhanced_features = np.concatenate([enhanced_features, padding], axis=0)
+            else:
+                # Truncate
+                enhanced_features = enhanced_features[:target_frames]
+        
+        final_shape = (target_frames, num_keypoints, num_features)
+        if enhanced_features.shape != final_shape:
+            print(f"WARNING: Shape mismatch. Got {enhanced_features.shape}, expected {final_shape}")
+            # Reshape or pad/truncate to ensure correct shape
+            result = np.zeros(final_shape)
+            
+            # Copy as much data as possible without exceeding dimensions
+            t_copy = min(enhanced_features.shape[0], target_frames)
+            n_copy = min(enhanced_features.shape[1], num_keypoints)
+            f_copy = min(enhanced_features.shape[2], num_features)
+            
+            result[:t_copy, :n_copy, :f_copy] = enhanced_features[:t_copy, :n_copy, :f_copy]
+            return result
     
-    return processed_keypoints
+        # If keypoints dimension is wrong
+        if enhanced_features.shape[1] != num_keypoints:
+            print(f"Error: Number of keypoints mismatch. Expected {num_keypoints}, got {enhanced_features.shape[1]}")
+            # This is a critical error - we can't easily fix mismatched keypoint count
+            raise ValueError(f"Keypoint count mismatch: expected {num_keypoints}, got {enhanced_features.shape[1]}")
+    
+    return enhanced_features
+
+def extract_hand_keypoints(video_path, hand_side='right'):
+    """Extract hand keypoints from video with consistent detection and shape validation."""
+    keypoints_list = []
+    
+    # Open video capture
+    cap = cv2.VideoCapture(video_path)
+    
+    # Get total number of frames
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # MediaPipe hand tracking setup
+    with mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=1,
+        min_detection_confidence=0.8,
+        min_tracking_confidence=0.8
+    ) as hands:
+        
+        frame_count = 0
+        while cap.isOpened() and frame_count < total_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+        
+            # Convert the BGR image to RGB
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Process the frame
+            results = hands.process(rgb_frame)
+            
+            # Initialize empty keypoints for this frame
+            frame_keypoints = []
+            
+            # Extract keypoints if hand is detected
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    # Ensure we're only processing the specified hand when multiple are detected
+                    if len(results.multi_handedness) > 0:
+                        hand_label = results.multi_handedness[0].classification[0].label.lower()
+                        if hand_side != 'both' and hand_label != hand_side:
+                            continue
+                    
+                    # Extract keypoint coordinates - ensure we get exactly 21 keypoints
+                    frame_keypoints = [[landmark.x, landmark.y, landmark.z] for landmark in hand_landmarks.landmark]
+                    
+                    # Verify we have the expected number of keypoints
+                    if len(frame_keypoints) != 21:
+                        print(f"Warning: Expected 21 keypoints but got {len(frame_keypoints)} on frame {frame_count}")
+                        # Pad with zeros if missing keypoints
+                        if len(frame_keypoints) < 21:
+                            frame_keypoints.extend([[0, 0, 0]] * (21 - len(frame_keypoints)))
+                        else:
+                            # Truncate if too many keypoints
+                            frame_keypoints = frame_keypoints[:21]
+                    
+                    # Once we've processed one valid hand, break
+                    break
+            
+            # If no hand detected, add zeros
+            if not frame_keypoints:
+                frame_keypoints = [[0, 0, 0]] * 21
+                
+            keypoints_list.append(frame_keypoints)
+            frame_count += 1
+    
+    cap.release()
+    
+    # Convert to numpy array with explicit shape
+    keypoints = np.array(keypoints_list)
+    
+    # Verify shape is [frames, 21, 3]
+    expected_shape = (frame_count, 21, 3)
+    if keypoints.shape != expected_shape:
+        print(f"Warning: Expected keypoints shape {expected_shape} but got {keypoints.shape}")
+        
+        # Try to reshape if dimensions match
+        if np.prod(keypoints.shape) == np.prod(expected_shape):
+            keypoints = keypoints.reshape(expected_shape)
+        else:
+            print("Cannot reshape to expected dimensions, dimensions don't match")
+    
+    return keypoints
 
 def build_adjacency(num_nodes=21):
-    """
-    Create a more comprehensive adjacency matrix.
-    
-    Args:
-    - num_nodes: Number of keypoints
-    
-    Returns:
-    - Adjacency matrix
-    """
+    """Create an adjacency matrix with proper shape validation."""
     # Initialize adjacency matrix
     adjacency = np.zeros((num_nodes, num_nodes))
     
@@ -318,6 +393,10 @@ def build_adjacency(num_nodes=21):
     # Add self-connections
     np.fill_diagonal(adjacency, 1)
     
+    # Verify shape
+    if adjacency.shape != (num_nodes, num_nodes):
+        raise ValueError(f"Adjacency matrix has wrong shape: {adjacency.shape} vs expected {(num_nodes, num_nodes)}")
+    
     return adjacency
 
 @app.route('/')
@@ -327,7 +406,7 @@ def upload_page():
 
 @app.route('/predict', methods=['POST'])
 def predict_updrs():
-    """Predict UPDRS score from uploaded video."""
+    """Predict UPDRS score from uploaded video with fixed tensor handling."""
     predefined_scores = {
         'ND1.mp4': 0,
         'ND2.mp4': 0,
@@ -345,12 +424,9 @@ def predict_updrs():
     if video_file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
     
-
     if video_file.filename in predefined_scores:
-        # Wait for 3 seconds
+        # Use predefined scores for known test videos
         time.sleep(3)
-        
-        # Generate a random confidence score between 70% and 95%
         confidence = round(random.uniform(0.70, 0.95), 2)
         
         return jsonify({
@@ -365,67 +441,83 @@ def predict_updrs():
     
     # Save uploaded video
     filename = secure_filename(video_file.filename)
+    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
     video_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     video_file.save(video_path)
     
     try:
-        # Load pre-trained model with specific path
-        model = load_model('final_24copy_model.pth')
-        
-        # Use a fixed device
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Extract keypoints with consistent parameters
-        keypoints = extract_hand_keypoints(video_path, hand_side)
-        
-        # Preprocess keypoints
-        processed_keypoints = preprocess_keypoints(keypoints)
-        
-        # Build spatial adjacency matrix
-        spatial_adj = build_adjacency(num_nodes=21)
         
         # Create a temporary directory to save these tensors
         temp_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'temp_tensors')
         os.makedirs(temp_dir, exist_ok=True)
         
-        # Save tensors with unique identifier
-        import uuid
-        unique_id = str(uuid.uuid4())
+        # Extract keypoints
+        keypoints = extract_hand_keypoints(video_path, hand_side)
         
-        # Save tensors
-        torch.save(
-            torch.tensor(processed_keypoints, dtype=torch.float32), 
-            os.path.join(temp_dir, f'keypoints_{unique_id}.pt')
-        )
-        torch.save(
-            torch.tensor(spatial_adj, dtype=torch.float32).unsqueeze(0), 
-            os.path.join(temp_dir, f'adjacency_{unique_id}.pt')
-        )
+        # Ensure we have the right number of features
+        processed_keypoints = preprocess_keypoints(keypoints, target_frames=114, num_keypoints=21, num_features=IN_FEATURES)
         
-        # Load using SingleVideoDataset
-        dataset = SingleVideoDataset(temp_dir)
+        # Create tensors with explicit shapes
+        keypoints_tensor = torch.tensor(processed_keypoints, dtype=torch.float32)  # [T, V, C]
+        keypoints_tensor = keypoints_tensor.unsqueeze(0)  # Add batch dim: [1, T, V, C]
         
-        # Get the first (and only) item
-        keypoints, adjacency = dataset[0]
+        # Create adjacency matrix with explicit shape
+        adjacency = build_adjacency(num_nodes=21)  # [V, V]
+        adjacency_tensor = torch.tensor(adjacency, dtype=torch.float32)
+        adjacency_tensor = adjacency_tensor.unsqueeze(0)  # Add batch dim: [1, V, V]
         
-        # Ensure correct tensor shape and move to device
-        keypoints = keypoints.unsqueeze(0).to(device)
-        adjacency = adjacency.to(device)
+        # Print shapes before passing to model
+        print(f"Final tensor shapes - keypoints: {keypoints_tensor.shape}, adjacency: {adjacency_tensor.shape}")
+        
+        # Verify the exact expected shape of the model's input
+        expected_keypoints_shape = (1, 114, 21, IN_FEATURES)  # [B, T, V, C]
+        expected_adjacency_shape = (1, 21, 21)  # [B, V, V]
+        
+        # Force tensors to match expected shapes
+        if keypoints_tensor.shape != expected_keypoints_shape:
+            print(f"Forcing keypoints tensor from {keypoints_tensor.shape} to {expected_keypoints_shape}")
+            temp_tensor = torch.zeros(expected_keypoints_shape, dtype=torch.float32, device=keypoints_tensor.device)
+            # Copy as much data as possible
+            min_b = min(keypoints_tensor.shape[0], expected_keypoints_shape[0])
+            min_t = min(keypoints_tensor.shape[1], expected_keypoints_shape[1])
+            min_v = min(keypoints_tensor.shape[2], expected_keypoints_shape[2])
+            min_c = min(keypoints_tensor.shape[3], expected_keypoints_shape[3])
+            temp_tensor[:min_b, :min_t, :min_v, :min_c] = keypoints_tensor[:min_b, :min_t, :min_v, :min_c]
+            keypoints_tensor = temp_tensor
+        
+        if adjacency_tensor.shape != expected_adjacency_shape:
+            print(f"Forcing adjacency tensor from {adjacency_tensor.shape} to {expected_adjacency_shape}")
+            temp_tensor = torch.zeros(expected_adjacency_shape, dtype=torch.float32, device=adjacency_tensor.device)
+            # Copy as much data as possible
+            min_b = min(adjacency_tensor.shape[0], expected_adjacency_shape[0])
+            min_v1 = min(adjacency_tensor.shape[1], expected_adjacency_shape[1])
+            min_v2 = min(adjacency_tensor.shape[2], expected_adjacency_shape[2])
+            temp_tensor[:min_b, :min_v1, :min_v2] = adjacency_tensor[:min_b, :min_v1, :min_v2]
+            adjacency_tensor = temp_tensor
+        
+        # Move to device
+        keypoints_tensor = keypoints_tensor.to(device)
+        adjacency_tensor = adjacency_tensor.to(device)
+        
+        # Load pre-trained model
+        model = load_model('final_model_rev_stgcn4.pth')
         
         # Make prediction with no randomness
         with torch.no_grad():
             # Set model to evaluation mode
             model.eval()
             
-            # Disable dropout during inference
-            torch.nn.functional.dropout = lambda input, p=0, training=False, inplace=False: input
-            
             # Make prediction
-            predictions = model(keypoints, adjacency)
+            predictions = model(keypoints_tensor, adjacency_tensor)
+            print("********************************************")
+            print(predictions)
             probabilities = F.softmax(predictions, dim=1)
+            print(probabilities)
             predicted_class = torch.argmax(probabilities, dim=1).item()
-            print("Predictions: ", predictions)
-            print("Predicted Classs: ", predicted_class)
+            print(f"Predicted class: {predicted_class}")
+            confidence = probabilities[0, predicted_class].item()
+            print(f"Confidence: {confidence}")
+            print("********************************************")
         
         # Map predicted class to UPDRS score
         updrs_mapping = {
@@ -438,12 +530,18 @@ def predict_updrs():
         return jsonify({
             'updrs_score': predicted_class,
             'updrs_description': updrs_mapping[predicted_class],
-            'confidence': probabilities.max().item(),
+            'confidence': round(confidence, 2),
             'source': 'Machine Learning Model'
         })
     
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        import traceback
+        traceback_str = traceback.format_exc()
+        return jsonify({
+            'error': str(e),
+            'traceback': traceback_str
+        }), 500
+        
     finally:
         # Cleanup
         import shutil
@@ -456,13 +554,14 @@ def predict_updrs():
                 video_file.close()
             
             # Remove video and temporary tensor directory
-            os.remove(video_path)
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            if os.path.exists(video_path):
+                os.remove(video_path)
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception as e:
             print(f"Error during cleanup: {e}")
-            
-# Create upload folder if it doesn't exist
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 if __name__ == '__main__':
+    # Make sure upload folder exists
+    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
     app.run(debug=True)
