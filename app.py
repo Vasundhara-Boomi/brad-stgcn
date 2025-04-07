@@ -370,7 +370,7 @@ def predict_updrs():
     
     try:
         # Load pre-trained model with specific path
-        model = load_model('final_24copy_model.pth')
+        model = load_model('best_model_averageacc.pth')
         
         # Use a fixed device
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
